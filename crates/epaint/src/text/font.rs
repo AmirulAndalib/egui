@@ -1,11 +1,13 @@
+use std::collections::BTreeMap;
+use std::sync::Arc;
+
+use emath::{vec2, GuiRounding, Vec2};
+
 use crate::{
     mutex::{Mutex, RwLock},
     text::FontTweak,
     TextureAtlas,
 };
-use emath::{vec2, Vec2};
-use std::collections::BTreeSet;
-use std::sync::Arc;
 
 // ----------------------------------------------------------------------------
 
@@ -88,28 +90,24 @@ impl FontImpl {
         ab_glyph_font: ab_glyph::FontArc,
         scale_in_pixels: f32,
         tweak: FontTweak,
-    ) -> FontImpl {
+    ) -> Self {
         assert!(scale_in_pixels > 0.0);
         assert!(pixels_per_point > 0.0);
 
-        use ab_glyph::*;
+        use ab_glyph::{Font, ScaleFont};
         let scaled = ab_glyph_font.as_scaled(scale_in_pixels);
-        let ascent = scaled.ascent() / pixels_per_point;
-        let descent = scaled.descent() / pixels_per_point;
-        let line_gap = scaled.line_gap() / pixels_per_point;
+        let ascent = (scaled.ascent() / pixels_per_point).round_ui();
+        let descent = (scaled.descent() / pixels_per_point).round_ui();
+        let line_gap = (scaled.line_gap() / pixels_per_point).round_ui();
 
         // Tweak the scale as the user desired
         let scale_in_pixels = scale_in_pixels * tweak.scale;
+        let scale_in_points = scale_in_pixels / pixels_per_point;
 
-        let baseline_offset = {
-            let scale_in_points = scale_in_pixels / pixels_per_point;
-            scale_in_points * tweak.baseline_offset_factor
-        };
+        let baseline_offset = (scale_in_points * tweak.baseline_offset_factor).round_ui();
 
-        let y_offset_points = {
-            let scale_in_points = scale_in_pixels / pixels_per_point;
-            scale_in_points * tweak.y_offset_factor
-        } + tweak.y_offset;
+        let y_offset_points =
+            ((scale_in_points * tweak.y_offset_factor) + tweak.y_offset).round_ui();
 
         // Center scaled glyphs properly:
         let height = ascent + descent;
@@ -139,6 +137,12 @@ impl FontImpl {
     ///
     /// See also [`invisible_char`].
     fn ignore_character(&self, chr: char) -> bool {
+        use crate::text::FontDefinitions;
+
+        if !FontDefinitions::builtin_font_names().contains(&self.name.as_str()) {
+            return false;
+        }
+
         if self.name == "emoji-icon-font" {
             // HACK: https://github.com/emilk/egui/issues/1284 https://github.com/jslegers/emoji-icon-font/issues/18
             // Don't show the wrong fullwidth capital letters:
@@ -239,6 +243,8 @@ impl FontImpl {
     }
 
     /// Height of one row of text in points.
+    ///
+    /// Returns a value rounded to [`emath::GUI_ROUNDING`].
     #[inline(always)]
     pub fn row_height(&self) -> f32 {
         self.height_in_points
@@ -273,15 +279,18 @@ impl FontImpl {
             if glyph_width == 0 || glyph_height == 0 {
                 UvRect::default()
             } else {
-                let atlas = &mut self.atlas.lock();
-                let (glyph_pos, image) = atlas.allocate((glyph_width, glyph_height));
-                glyph.draw(|x, y, v| {
-                    if v > 0.0 {
-                        let px = glyph_pos.0 + x as usize;
-                        let py = glyph_pos.1 + y as usize;
-                        image[(px, py)] = v;
-                    }
-                });
+                let glyph_pos = {
+                    let atlas = &mut self.atlas.lock();
+                    let (glyph_pos, image) = atlas.allocate((glyph_width, glyph_height));
+                    glyph.draw(|x, y, v| {
+                        if 0.0 < v {
+                            let px = glyph_pos.0 + x as usize;
+                            let py = glyph_pos.1 + y as usize;
+                            image[(px, py)] = v;
+                        }
+                    });
+                    glyph_pos
+                };
 
                 let offset_in_pixels = vec2(bb.min.x, bb.min.y);
                 let offset =
@@ -321,7 +330,7 @@ pub struct Font {
     fonts: Vec<Arc<FontImpl>>,
 
     /// Lazily calculated.
-    characters: Option<BTreeSet<char>>,
+    characters: Option<BTreeMap<char, Vec<String>>>,
 
     replacement_glyph: (FontIndex, GlyphInfo),
     pixels_per_point: f32,
@@ -361,9 +370,11 @@ impl Font {
             .glyph_info_no_cache_or_fallback(PRIMARY_REPLACEMENT_CHAR)
             .or_else(|| slf.glyph_info_no_cache_or_fallback(FALLBACK_REPLACEMENT_CHAR))
             .unwrap_or_else(|| {
-                panic!(
-                    "Failed to find replacement characters {PRIMARY_REPLACEMENT_CHAR:?} or {FALLBACK_REPLACEMENT_CHAR:?}"
-                )
+                #[cfg(feature = "log")]
+                log::warn!(
+                    "Failed to find replacement characters {PRIMARY_REPLACEMENT_CHAR:?} or {FALLBACK_REPLACEMENT_CHAR:?}. Will use empty glyph."
+                );
+                (0, GlyphInfo::default())
             });
         slf.replacement_glyph = replacement_glyph;
 
@@ -387,12 +398,14 @@ impl Font {
         self.glyph_info(crate::text::PASSWORD_REPLACEMENT_CHAR);
     }
 
-    /// All supported characters.
-    pub fn characters(&mut self) -> &BTreeSet<char> {
+    /// All supported characters, and in which font they are available in.
+    pub fn characters(&mut self) -> &BTreeMap<char, Vec<String>> {
         self.characters.get_or_insert_with(|| {
-            let mut characters = BTreeSet::new();
+            let mut characters: BTreeMap<char, Vec<String>> = Default::default();
             for font in &self.fonts {
-                characters.extend(font.characters());
+                for chr in font.characters() {
+                    characters.entry(chr).or_default().push(font.name.clone());
+                }
             }
             characters
         })
@@ -403,7 +416,9 @@ impl Font {
         (point * self.pixels_per_point).round() / self.pixels_per_point
     }
 
-    /// Height of one row of text. In points
+    /// Height of one row of text. In points.
+    ///
+    /// Returns a value rounded to [`emath::GUI_ROUNDING`].
     #[inline(always)]
     pub fn row_height(&self) -> f32 {
         self.row_height
@@ -451,6 +466,14 @@ impl Font {
         let (font_index, glyph_info) = self.glyph_info(c);
         let font_impl = &self.fonts[font_index];
         (Some(font_impl), glyph_info)
+    }
+
+    pub(crate) fn ascent(&self) -> f32 {
+        if let Some(first) = self.fonts.first() {
+            first.ascent()
+        } else {
+            self.row_height
+        }
     }
 
     fn glyph_info_no_cache_or_fallback(&mut self, c: char) -> Option<(FontIndex, GlyphInfo)> {
